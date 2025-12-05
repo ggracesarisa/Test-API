@@ -2,21 +2,20 @@ import { NextResponse } from 'next/server';
 import { GoogleGenAI, GenerateContentParameters, Part } from '@google/genai';
 
 // ---------------------------------------------------
-// CORS CONFIG (เวอร์ชันใช้ได้บน Vercel)
+// CORS CONFIG
 // ---------------------------------------------------
 const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",  // หรือระบุโดเมนก็ได้ เช่น "https://myapp.vercel.app"
+    "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
-// Preflight (OPTIONS) — จำเป็นสำหรับ fetch() ของ frontend
 export function OPTIONS() {
     return NextResponse.json({}, { status: 200, headers: corsHeaders });
 }
 
 // ---------------------------------------------------
-// 1. การตั้งค่าและ Prompt
+// Model Setup and Prompt Template
 // ---------------------------------------------------
 
 const apiKey = process.env.GEMINI_API_KEY;
@@ -25,18 +24,30 @@ if (!apiKey) {
 }
 const ai = new GoogleGenAI({ apiKey });
 
-const PROMPT: string = (
-    "คุณคือระบบวิเคราะห์ภาพรองเท้าและแนะนำเวลาการเป่าแห้ง โปรดวิเคราะห์ภาพรองเท้าและให้ข้อมูลออกมาในรูปแบบ JSON Object เท่านั้น " +
-    "โดยให้มีโครงสร้างดังนี้:\n" +
-    "1. 'shoe_type': ประเภทของรองเท้าและคำอธิบายสั้นๆ (เช่น 'รองเท้าผ้าใบ (ประเภท Sneakers) ความหนาปานกลาง')\n" +
-    "2. 'recommended_time_minutes': เวลาที่แนะนำในการเป่าแห้ง (เป็นตัวเลขหน่วยนาที ไม่เกิน 60)\n" +
-    "เงื่อนไขการอบ: ตู้อบสาธารณะ, พัดลมความร้อน (40–55°C), ห้ามเกิน 60 นาที\n\n" +
-    "**สำคัญ: Output ต้องเป็น JSON Object ที่ถูกต้องเท่านั้น ไม่มีข้อความอธิบายใด ๆ เพิ่มเติมก่อนหรือหลัง**\n" +
-    "ตัวอย่าง Output:\n" +
-    "{\"shoe_type\": \"รองเท้าผ้าใบ (ประเภท Sneakers) ความหนาปานกลาง\", \"recommended_time_minutes\": 40}"
-);
+function buildPrompt(temp: number, humidity: number): string {
+    return (
+        "คุณคือระบบวิเคราะห์ภาพรองเท้าและแนะนำเวลาการเป่าแห้ง โดยต้องพิจารณาทั้งรูปภาพรองเท้า " +
+        "รวมถึงข้อมูลความชื้นและอุณหภูมิที่ผู้ใช้ส่งมาให้ด้วย โปรดให้คำตอบในรูปแบบ JSON Object เท่านั้น\n\n" +
 
-// Helper function: แปลง File Object → Gemini Part
+        `ความชื้นปัจจุบัน (humidity): ${humidity}%\n` +
+        `อุณหภูมิ (temperature): ${temp}°C\n\n` +
+
+        "หลักการคำนวณ:\n" +
+        "• รองเท้าประเภทเดียวกันอาจมีเวลามาตรฐาน เช่น Sneakers เฉลี่ย 30 นาที\n" +
+        "• หากความชื้นสูง (เช่น >70%) ให้เพิ่มเวลาอบตามความเหมาะสม\n" +
+        "• แต่เวลาอบรวมต้องไม่เกิน 60 นาที\n" +
+        "• ตู้อบ: ใช้พัดลมความร้อน 40–55°C\n\n" +
+
+        "รูปแบบ Output:\n" +
+        "1. 'shoe_type': ประเภทของรองเท้า พร้อมคำอธิบายสั้นๆ\n" +
+        "2. 'recommended_time_minutes': เวลาที่แนะนำ (ตัวเลข นาที ไม่เกิน 60)\n\n" +
+
+        "**สำคัญ: ให้ตอบเป็น JSON Object เท่านั้น ไม่มีข้อความอื่นเพิ่มเติม**\n" +
+        "ตัวอย่าง Output:\n" +
+        "{\"shoe_type\": \"รองเท้าผ้าใบ (Sneakers)\", \"recommended_time_minutes\": 40}"
+    );
+}
+
 async function fileToGenerativePart(file: File): Promise<Part> {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
@@ -49,7 +60,7 @@ async function fileToGenerativePart(file: File): Promise<Part> {
 }
 
 // ---------------------------------------------------
-// 2. Route Handler หลัก (POST)
+// Main Route Handler
 // ---------------------------------------------------
 
 export async function POST(request: Request) {
@@ -57,15 +68,15 @@ export async function POST(request: Request) {
 
     try {
         const formData = await request.formData();
-        const fileEntry = formData.get('file');
 
+        // Extract uploaded image file
+        const fileEntry = formData.get('file');
         if (!fileEntry || typeof fileEntry === 'string' || !(fileEntry instanceof File)) {
             return NextResponse.json(
                 { error: 'Invalid or missing file upload (expecting field name "file").' },
                 { status: 400, headers: corsHeaders }
             );
         }
-        
         imageFile = fileEntry;
 
         if (!imageFile.size) {
@@ -75,10 +86,32 @@ export async function POST(request: Request) {
             );
         }
 
+        // Extract humidity and temperature 
+        const humidityRaw = formData.get("humidity");
+        const tempRaw = formData.get("temperature");
+
+        const humidity = humidityRaw ? Number(humidityRaw) : undefined;
+        const temperature = tempRaw ? Number(tempRaw) : undefined;
+
+        if (
+            humidity === undefined ||
+            temperature === undefined ||
+            isNaN(humidity) ||
+            isNaN(temperature)
+        ) {
+            return NextResponse.json(
+                { error: "Missing or invalid humidity/temperature. Both must be numeric." },
+                { status: 400, headers: corsHeaders }
+            );
+        }
+
         const imagePart = await fileToGenerativePart(imageFile);
 
+        // Build dynamic prompt
+        const prompt = buildPrompt(temperature, humidity);
+
         const contents: GenerateContentParameters['contents'] = [
-            { role: "user", parts: [{ text: PROMPT }, imagePart] }
+            { role: "user", parts: [{ text: prompt }, imagePart] }
         ];
 
         const response = await ai.models.generateContent({
@@ -109,7 +142,7 @@ export async function POST(request: Request) {
 
                 return NextResponse.json(
                     {
-                        error: "Analysis successful but failed to parse JSON output from Gemini. Check prompt compliance.",
+                        error: "Analysis succeeded but the JSON response from Gemini could not be parsed.",
                         gemini_raw_output: generatedText,
                     },
                     { status: 500, headers: corsHeaders }
@@ -122,6 +155,8 @@ export async function POST(request: Request) {
                     filesize: imageFile.size,
                     shoe_type: analysisObject.shoe_type,
                     recommended_time_minutes: analysisObject.recommended_time_minutes,
+                    temperature,
+                    humidity,
                     model_used: "gemini-2.5-flash",
                 },
                 { headers: corsHeaders }
@@ -132,7 +167,7 @@ export async function POST(request: Request) {
         if (feedback && feedback.blockReason) {
             return NextResponse.json(
                 {
-                    error: `Content was blocked due to safety settings: ${feedback.blockReason}`,
+                    error: `Content blocked due to safety settings: ${feedback.blockReason}`,
                     safety_ratings: feedback.safetyRatings
                 },
                 { status: 403, headers: corsHeaders }
@@ -142,7 +177,7 @@ export async function POST(request: Request) {
         console.error("Gemini failed to generate content:", response);
         return NextResponse.json(
             {
-                error: 'Gemini did not return any text output or the response structure was unexpected.',
+                error: 'Gemini did not return valid text. See debug info.',
                 full_response_debug: response
             },
             { status: 500, headers: corsHeaders }
@@ -153,8 +188,8 @@ export async function POST(request: Request) {
 
         return NextResponse.json(
             {
-                error: 'Failed to process the request due to an internal server error.',
-                details: error instanceof Error ? error.message : 'An unknown error occurred.'
+                error: 'Internal server error occurred while processing your request.',
+                details: error instanceof Error ? error.message : 'Unknown error.'
             },
             { status: 500, headers: corsHeaders }
         );
